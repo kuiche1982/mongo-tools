@@ -10,11 +10,9 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/mongodb/mongo-tools/common/archive"
-	"github.com/mongodb/mongo-tools/common/auth"
 	"github.com/mongodb/mongo-tools/common/db"
 	"github.com/mongodb/mongo-tools/common/intents"
 	"github.com/mongodb/mongo-tools/common/log"
@@ -31,6 +29,29 @@ type ChannelRestore struct {
 	DocChan chan<- bson.Raw
 }
 
+func CreateChannelRestoreOption(dir, versionStr, gitCommit string) Options {
+	opts := options.New("mongorestore", versionStr, gitCommit, Usage, false,
+		options.EnabledOptions{Auth: false, Connection: false, Namespace: false, URI: false})
+	opts.Namespace.DB = "fakedb"
+	nsOpts := &NSOptions{}
+	opts.AddOptions(nsOpts)
+
+	inputOpts := &InputOptions{Gzip: true, RestoreDBUsersAndRoles: false, Objcheck: false, OplogReplay: false}
+	opts.AddOptions(inputOpts)
+
+	outputOpts := &OutputOptions{NoIndexRestore: true, NoOptionsRestore: true, NumParallelCollections: 4}
+	opts.AddOptions(outputOpts)
+
+	log.SetVerbosity(opts.Verbosity)
+
+	// verify uri options and log them
+	opts.URI.LogUnsupportedOptions()
+
+	targetDir := util.ToUniversalPath(dir)
+
+	return Options{opts, inputOpts, nsOpts, outputOpts, targetDir, true}
+}
+
 // Restore runs the mongorestore program.
 func (restore *ChannelRestore) Restore() Result {
 	var target archive.DirLike
@@ -40,284 +61,36 @@ func (restore *ChannelRestore) Restore() Result {
 		log.Logvf(log.DebugLow, "got error from options parsing: %v", err)
 		return Result{Err: err}
 	}
-
-	// Build up all intents to be restored
+	target, _ = newActualPath(restore.TargetDirectory)
 	restore.manager = intents.NewIntentManager()
-	if restore.InputOptions.Archive == "" && restore.InputOptions.OplogReplay {
-		restore.manager.SetSmartPickOplog(true)
-	}
-
-	if restore.InputOptions.Archive != "" {
-		if restore.archive == nil {
-			archiveReader, err := restore.getArchiveReader()
-			if err != nil {
-				return Result{Err: err}
-			}
-			restore.archive = &archive.Reader{
-				In:      archiveReader,
-				Prelude: &archive.Prelude{},
-			}
-			defer restore.archive.In.Close()
-		}
-		err = restore.archive.Prelude.Read(restore.archive.In)
+	// handle cases where the user passes in a file instead of a directory
+	if !target.IsDir() {
+		log.Logv(log.DebugLow, "mongorestore target is a file, not a directory")
+		err = restore.handleBSONInsteadOfDirectory(restore.TargetDirectory)
 		if err != nil {
 			return Result{Err: err}
 		}
-		log.Logvf(log.DebugLow, `archive format version "%v"`, restore.archive.Prelude.Header.FormatVersion)
-		log.Logvf(log.DebugLow, `archive server version "%v"`, restore.archive.Prelude.Header.ServerVersion)
-		log.Logvf(log.DebugLow, `archive tool version "%v"`, restore.archive.Prelude.Header.ToolVersion)
-		target, err = restore.archive.Prelude.NewPreludeExplorer()
-		if err != nil {
-			return Result{Err: err}
-		}
-	} else if restore.TargetDirectory != "-" {
-		var usedDefaultTarget bool
-		if restore.TargetDirectory == "" {
-			restore.TargetDirectory = "dump"
-			log.Logv(log.Always, "using default 'dump' directory")
-			usedDefaultTarget = true
-		}
-		target, err = newActualPath(restore.TargetDirectory)
-		if err != nil {
-			if usedDefaultTarget {
-				log.Logv(log.Always, util.ShortUsage("mongorestore"))
-			}
-			return Result{Err: fmt.Errorf("mongorestore target '%v' invalid: %v", restore.TargetDirectory, err)}
-		}
-		// handle cases where the user passes in a file instead of a directory
-		if !target.IsDir() {
-			log.Logv(log.DebugLow, "mongorestore target is a file, not a directory")
-			err = restore.handleBSONInsteadOfDirectory(restore.TargetDirectory)
-			if err != nil {
-				return Result{Err: err}
-			}
-		} else {
-			log.Logv(log.DebugLow, "mongorestore target is a directory, not a file")
-		}
-	}
-	if restore.ToolOptions.Namespace.Collection != "" &&
-		restore.OutputOptions.NumParallelCollections > 1 &&
-		restore.OutputOptions.NumInsertionWorkers == 1 &&
-		!restore.OutputOptions.MaintainInsertionOrder {
-		// handle special parallelization case when we are only restoring one collection
-		// by mapping -j to insertion workers rather than parallel collections
-		log.Logvf(log.DebugHigh,
-			"setting number of insertions workers to number of parallel collections (%v)",
-			restore.OutputOptions.NumParallelCollections)
-		restore.OutputOptions.NumInsertionWorkers = restore.OutputOptions.NumParallelCollections
-	}
-	if restore.InputOptions.Archive != "" {
-		if int(restore.archive.Prelude.Header.ConcurrentCollections) > restore.OutputOptions.NumParallelCollections {
-			restore.OutputOptions.NumParallelCollections = int(restore.archive.Prelude.Header.ConcurrentCollections)
-			log.Logvf(log.Always,
-				"setting number of parallel collections to number of parallel collections in archive (%v)",
-				restore.archive.Prelude.Header.ConcurrentCollections,
-			)
-		}
 	}
 
-	// Create the demux before intent creation, because muted archive intents need
-	// to register themselves with the demux directly
-	if restore.InputOptions.Archive != "" {
-		restore.archive.Demux = archive.CreateDemux(restore.archive.Prelude.NamespaceMetadatas, restore.archive.In)
-	}
+	err = restore.CreateIntentsForDB(
+		restore.ToolOptions.Namespace.DB,
+		target,
+	)
 
-	switch {
-	case restore.InputOptions.Archive != "":
-		log.Logvf(log.Always, "preparing collections to restore from")
-		err = restore.CreateAllIntents(target)
-	case restore.ToolOptions.Namespace.DB != "" && restore.ToolOptions.Namespace.Collection == "":
-		log.Logvf(log.Always,
-			"building a list of collections to restore from %v dir",
-			target.Path())
-		err = restore.CreateIntentsForDB(
-			restore.ToolOptions.Namespace.DB,
-			target,
-		)
-	case restore.ToolOptions.Namespace.DB != "" && restore.ToolOptions.Namespace.Collection != "" && restore.TargetDirectory == "-":
-		log.Logvf(log.Always, "setting up a collection to be read from standard input")
-		err = restore.CreateStdinIntentForCollection(
-			restore.ToolOptions.Namespace.DB,
-			restore.ToolOptions.Namespace.Collection,
-		)
-	case restore.ToolOptions.Namespace.DB != "" && restore.ToolOptions.Namespace.Collection != "":
-		log.Logvf(log.Always, "checking for collection data in %v", target.Path())
-		err = restore.CreateIntentForCollection(
-			restore.ToolOptions.Namespace.DB,
-			restore.ToolOptions.Namespace.Collection,
-			target,
-		)
-	default:
-		log.Logvf(log.Always, "preparing collections to restore from")
-		err = restore.CreateAllIntents(target)
-	}
 	if err != nil {
 		return Result{Err: fmt.Errorf("error scanning filesystem: %v", err)}
 	}
-
-	if restore.isMongos && restore.manager.HasConfigDBIntent() && restore.ToolOptions.Namespace.DB == "" {
-		return Result{Err: fmt.Errorf("cannot do a full restore on a sharded system - " +
-			"remove the 'config' directory from the dump directory first")}
-	}
-
-	if restore.InputOptions.OplogFile != "" {
-		err = restore.CreateIntentForOplog()
-		if err != nil {
-			return Result{Err: fmt.Errorf("error reading oplog file: %v", err)}
-		}
-	}
-	if restore.InputOptions.OplogReplay && restore.manager.Oplog() == nil {
-		return Result{Err: fmt.Errorf("no oplog file to replay; make sure you run mongodump with --oplog")}
-	}
-	if restore.manager.GetOplogConflict() {
-		return Result{Err: fmt.Errorf("cannot provide both an oplog.bson file and an oplog file with --oplogFile, " +
-			"nor can you provide both a local/oplog.rs.bson and a local/oplog.$main.bson file")}
-	}
-
-	conflicts := restore.manager.GetDestinationConflicts()
-	if len(conflicts) > 0 {
-		for _, conflict := range conflicts {
-			log.Logvf(log.Always, "%s", conflict.Error())
-		}
-		return Result{Err: fmt.Errorf("cannot restore with conflicting namespace destinations")}
-	}
-
-	if restore.OutputOptions.DryRun {
-		log.Logvf(log.Always, "dry run completed")
-		return Result{}
-	}
-
-	demuxFinished := make(chan interface{})
-	var demuxErr error
-	if restore.InputOptions.Archive != "" {
-		namespaceChan := make(chan string, 1)
-		namespaceErrorChan := make(chan error)
-		restore.archive.Demux.NamespaceChan = namespaceChan
-		restore.archive.Demux.NamespaceErrorChan = namespaceErrorChan
-
-		go func() {
-			demuxErr = restore.archive.Demux.Run()
-			close(demuxFinished)
-		}()
-		// consume the new namespace announcement from the demux for all of the special collections
-		// that get cached when being read out of the archive.
-		// The first regular collection found gets pushed back on to the namespaceChan
-		// consume the new namespace announcement from the demux for all of the collections that get cached
-		for {
-			ns, ok := <-namespaceChan
-			// the archive can have only special collections. In that case we keep reading until
-			// the namespaces are exhausted, indicated by the namespaceChan being closed.
-			log.Logvf(log.DebugLow, "received %v from namespaceChan", ns)
-			if !ok {
-				break
-			}
-			dbName, collName := util.SplitNamespace(ns)
-			ns = dbName + "." + strings.TrimPrefix(collName, "system.buckets.")
-			intent := restore.manager.IntentForNamespace(ns)
-			if intent == nil {
-				return Result{Err: fmt.Errorf("no intent for collection in archive: %v", ns)}
-			}
-			if intent.IsSystemIndexes() ||
-				intent.IsUsers() ||
-				intent.IsRoles() ||
-				intent.IsAuthVersion() {
-				log.Logvf(log.DebugLow, "special collection %v found", ns)
-				namespaceErrorChan <- nil
-			} else {
-				// Put the ns back on the announcement chan so that the
-				// demultiplexer can start correctly
-				log.Logvf(log.DebugLow, "first non special collection %v found."+
-					" The demultiplexer will handle it and the remainder", ns)
-				namespaceChan <- ns
-				break
-			}
-		}
-	}
-
-	// If restoring users and roles, make sure we validate auth versions
-	if restore.ShouldRestoreUsersAndRoles() {
-		log.Logv(log.Info, "comparing auth version of the dump directory and target server")
-		restore.authVersions.Dump, err = restore.GetDumpAuthVersion()
-		if err != nil {
-			return Result{Err: fmt.Errorf("error getting auth version from dump: %v", err)}
-		}
-		restore.authVersions.Server, err = auth.GetAuthVersion(restore.SessionProvider)
-		if err != nil {
-			return Result{Err: fmt.Errorf("error getting auth version of server: %v", err)}
-		}
-		err = restore.ValidateAuthVersions()
-		if err != nil {
-			return Result{Err: fmt.Errorf(
-				"the users and roles collections in the dump have an incompatible auth version with target server: %v",
-				err)}
-		}
-	}
-
-	err = restore.LoadIndexesFromBSON()
-	if err != nil {
-		return Result{Err: fmt.Errorf("restore error: %v", err)}
-	}
-
+	restore.OutputOptions.NumInsertionWorkers = restore.OutputOptions.NumParallelCollections
 	err = restore.PopulateMetadataForIntents()
 	if err != nil {
 		return Result{Err: fmt.Errorf("restore error: %v", err)}
 	}
 
-	err = restore.preFlightChecks()
-	if err != nil {
-		return Result{Err: fmt.Errorf("restore error: %v", err)}
-	}
-
-	// Restore the regular collections
-	if restore.InputOptions.Archive != "" {
-		restore.manager.UsePrioritizer(restore.archive.Demux.NewPrioritizer(restore.manager))
-	} else if restore.OutputOptions.NumParallelCollections > 1 {
-		// 3.0+ has collection-level locking for writes, so it is most efficient to
-		// prioritize by collection size. Pre-3.0 we try to avoid inserting into collections
-		// in the same database simultaneously due to the database-level locking.
-		// Up to 4.2, foreground index builds take a database-level lock for the entire build,
-		// but this prioritizer is not used for index builds so we don't need to worry about that here.
-		if restore.serverVersion.GTE(db.Version{3, 0, 0}) {
-			restore.manager.Finalize(intents.LongestTaskFirst)
-		} else {
-			restore.manager.Finalize(intents.MultiDatabaseLTF)
-		}
-	} else {
-		// use legacy restoration order if we are single-threaded
-		restore.manager.Finalize(intents.Legacy)
-	}
+	restore.manager.Finalize(intents.MultiDatabaseLTF)
 
 	result := restore.RestoreIntents()
 	if result.Err != nil {
 		return result
-	}
-
-	// Restore users/roles
-	if restore.ShouldRestoreUsersAndRoles() {
-		err = restore.RestoreUsersOrRoles(restore.manager.Users(), restore.manager.Roles())
-		if err != nil {
-			return result.withErr(fmt.Errorf("restore error: %v", err))
-		}
-	}
-
-	// Restore oplog
-	if restore.InputOptions.OplogReplay {
-		err = restore.RestoreOplog()
-		if err != nil {
-			return result.withErr(fmt.Errorf("restore error: %v", err))
-		}
-	}
-
-	if !restore.OutputOptions.NoIndexRestore {
-		err = restore.RestoreIndexes()
-		if err != nil {
-			return result.withErr(err)
-		}
-	}
-
-	if restore.InputOptions.Archive != "" {
-		<-demuxFinished
-		return result.withErr(demuxErr)
 	}
 
 	return result
@@ -592,94 +365,12 @@ func (restore *ChannelRestore) RestoreIntents() Result {
 		}
 		restore.manager.Finish(intent)
 	}
+	close(restore.DocChan)
 	return totalResult
 }
 
 // RestoreIntent attempts to restore a given intent into MongoDB.
 func (restore *ChannelRestore) RestoreIntent(intent *intents.Intent) Result {
-	// collectionExists, err := restore.CollectionExists(intent.DB, intent.C)
-	// if err != nil {
-	// 	return Result{Err: fmt.Errorf("error reading database: %v", err)}
-	// }
-
-	// if !restore.OutputOptions.Drop && collectionExists {
-	// 	log.Logvf(log.Always, "restoring to existing collection %v without dropping", intent.Namespace())
-	// }
-
-	// if restore.OutputOptions.Drop {
-	// 	if collectionExists {
-	// 		if strings.HasPrefix(intent.C, "system.") {
-	// 			log.Logvf(log.Always, "cannot drop system collection %v, skipping", intent.Namespace())
-	// 		} else {
-	// 			log.Logvf(log.Always, "dropping collection %v before restoring", intent.Namespace())
-	// 			err = restore.DropCollection(intent)
-	// 			if err != nil {
-	// 				return Result{Err: err} // no context needed
-	// 			}
-	// 			collectionExists = false
-	// 		}
-	// 	} else {
-	// 		log.Logvf(log.DebugLow, "collection %v doesn't exist, skipping drop command", intent.Namespace())
-	// 	}
-	// }
-
-	// logMessageSuffix := "using options from metadata"
-
-	// // first create the collection with options from the metadata file
-	// uuid := intent.UUID
-	// options := bsonutil.MtoD(intent.Options)
-	// if len(options) == 0 {
-	// 	logMessageSuffix = "with no metadata"
-	// }
-
-	// var isClustered bool
-	// if v := intent.Options["clusteredIndex"]; v != nil {
-	// 	isClustered = true
-	// }
-
-	// // Clustered collections already have their _id index.
-	// if !isClustered {
-	// 	// The only way to specify options on the idIndex is at collection creation time.
-	// 	IDIndex := restore.indexCatalog.GetIndex(intent.DB, intent.C, "_id_")
-	// 	if IDIndex != nil {
-	// 		// Remove the index version (to use the default) unless otherwise specified.
-	// 		// If preserving UUID, we have to create a collection via
-	// 		// applyops, which requires the "v" key.
-	// 		if !restore.OutputOptions.KeepIndexVersion && !restore.OutputOptions.PreserveUUID {
-	// 			delete(IDIndex.Options, "v")
-	// 		}
-	// 		IDIndex.Options["ns"] = intent.Namespace()
-
-	// 		// If the collection has an idIndex, then we are about to create it, so
-	// 		// ignore the value of autoIndexId.
-	// 		for j, opt := range options {
-	// 			if opt.Key == "autoIndexId" {
-	// 				options = append(options[:j], options[j+1:]...)
-	// 			}
-	// 		}
-
-	// 		options = append(options, bson.E{"idIndex", *IDIndex})
-	// 	}
-	// }
-
-	// if restore.OutputOptions.NoOptionsRestore {
-	// 	log.Logv(log.Info, "not restoring collection options")
-	// 	logMessageSuffix = "with no collection options"
-	// 	options = nil
-	// }
-
-	// if !collectionExists {
-	// 	log.Logvf(log.Info, "creating collection %v %s", intent.Namespace(), logMessageSuffix)
-	// 	log.Logvf(log.DebugHigh, "using collection options: %#v", options)
-	// 	err = restore.CreateCollection(intent, options, uuid)
-	// 	if err != nil {
-	// 		return Result{Err: fmt.Errorf("error creating collection %v: %v", intent.Namespace(), err)}
-	// 	}
-	// 	restore.addToKnownCollections(intent)
-	// } else {
-	// 	log.Logvf(log.Info, "collection %v already exists - skipping collection create", intent.Namespace())
-	// }
-
 	var result Result
 	if intent.BSONFile != nil {
 		err := intent.BSONFile.Open()

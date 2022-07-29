@@ -28,30 +28,14 @@ var (
 
 func main() {
 	start := time.Now()
-	opts, err := mongorestore.ParseOptions(os.Args[1:], VersionStr, GitCommit)
-
-	if err != nil {
-		log.Logvf(log.Always, "error parsing command line options: %s", err.Error())
-		log.Logvf(log.Always, util.ShortUsage("mongorestore"))
-		os.Exit(util.ExitFailure)
-	}
-
-	// print help or version info, if specified
-	if opts.PrintHelp(false) {
-		return
-	}
-
-	if opts.PrintVersion() {
-		return
-	}
-	opts.ChannelRestore = true // notify extracted documents to channel
+	opts := mongorestore.CreateChannelRestoreOption("/Users/mobvista/gopath/src/kuik8srampup/s3read/data/new_adn", VersionStr, GitCommit)
 	docChan := make(chan bson.Raw)
 	// printDoneChan := make(chan struct{})
 	var wg sync.WaitGroup
-	var readThread = 30
-	wg.Add(readThread)
-	for i := 0; i < readThread; i++ {
+	var readThread = 10
 
+	for i := 0; i < readThread; i++ {
+		wg.Add(1)
 		// prints the output
 		go func() {
 			var failed, passed uint64
@@ -62,7 +46,7 @@ func main() {
 			for d := range docChan {
 
 				var i interface{}
-				if err = bson.Unmarshal(d, &i); err != nil {
+				if err := bson.Unmarshal(d, &i); err != nil {
 					// fmt.Printf("unmarshal bson error %v \n", err)
 					failed++
 					continue
