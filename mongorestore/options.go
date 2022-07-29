@@ -34,6 +34,7 @@ type Options struct {
 	*NSOptions
 	*OutputOptions
 	TargetDirectory string
+	ChannelRestore  bool
 }
 
 // InputOptions command line argument long names
@@ -183,7 +184,7 @@ func ParseOptions(rawArgs []string, versionStr, gitCommit string) (Options, erro
 	}
 	opts.WriteConcern = wc
 
-	return Options{opts, inputOpts, nsOpts, outputOpts, targetDir}, nil
+	return Options{opts, inputOpts, nsOpts, outputOpts, targetDir, false}, nil
 }
 
 // getTargetDirFromArgs handles the logic and error cases of figuring out

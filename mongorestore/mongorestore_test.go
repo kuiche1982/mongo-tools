@@ -62,11 +62,11 @@ func getRestoreWithArgs(additionalArgs ...string) (*MongoRestore, error) {
 		return nil, fmt.Errorf("error parsing args: %v", err)
 	}
 
-	restore, err := New(opts)
+	obj, err := New(opts, nil)
 	if err != nil {
 		return nil, fmt.Errorf("error making new instance of mongorestore: %v", err)
 	}
-
+	restore, _ := obj.(*MongoRestore)
 	return restore, nil
 }
 
@@ -1194,9 +1194,9 @@ func TestAutoIndexIdLocalDB(t *testing.T) {
 		retryWrites := false
 		opts.RetryWrites = &retryWrites
 
-		restore, err := New(opts)
+		obj, err := New(opts, nil)
 		So(err, ShouldBeNil)
-
+		restore, _ := obj.(*MongoRestore)
 		restore.TargetDirectory = "testdata/local/test_auto_idx.bson"
 		result := restore.Restore()
 		So(result.Err, ShouldBeNil)

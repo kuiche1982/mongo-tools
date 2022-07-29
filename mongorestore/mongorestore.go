@@ -28,6 +28,7 @@ import (
 	"github.com/mongodb/mongo-tools/common/progress"
 	"github.com/mongodb/mongo-tools/common/util"
 	"github.com/mongodb/mongo-tools/mongorestore/ns"
+	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
@@ -95,22 +96,36 @@ type MongoRestore struct {
 
 type collectionIndexes map[string][]*idx.IndexDocument
 
-// New initializes an instance of MongoRestore according to the provided options.
-func New(opts Options) (*MongoRestore, error) {
-	provider, err := db.NewSessionProvider(*opts.ToolOptions)
-	if err != nil {
-		return nil, fmt.Errorf("error connecting to host: %v", err)
-	}
+type Restoreer interface {
+	Close()
+	Restore() Result
+	GetToolOptions() *options.ToolOptions
+	HandleInterrupt()
+}
 
-	serverVersion, err := provider.ServerVersionArray()
-	if err != nil {
-		return nil, fmt.Errorf("error getting server version: %v", err)
+var _ Restoreer = &MongoRestore{}
+var _ Restoreer = &ChannelRestore{}
+
+// New initializes an instance of MongoRestore according to the provided options.
+func New(opts Options, docChan chan<- bson.Raw) (Restoreer, error) {
+	var provider *db.SessionProvider
+	var serverVersion db.Version
+	if !opts.ChannelRestore {
+		var err error
+		provider, err = db.NewSessionProvider(*opts.ToolOptions)
+		if err != nil {
+			return nil, fmt.Errorf("error connecting to host: %v", err)
+		}
+
+		serverVersion, err = provider.ServerVersionArray()
+		if err != nil {
+			return nil, fmt.Errorf("error getting server version: %v", err)
+		}
 	}
 
 	// start up the progress bar manager
 	progressManager := progress.NewBarWriter(log.Writer(0), progressBarWaitTime, progressBarLength, true)
 	progressManager.Start()
-
 	restore := &MongoRestore{
 		ToolOptions:     opts.ToolOptions,
 		OutputOptions:   opts.OutputOptions,
@@ -122,6 +137,16 @@ func New(opts Options) (*MongoRestore, error) {
 		serverVersion:   serverVersion,
 		terminate:       false,
 		indexCatalog:    idx.NewIndexCatalog(),
+	}
+	if opts.ChannelRestore {
+		if docChan == nil {
+			return nil, fmt.Errorf("error docChan parameter is nil")
+		}
+		channelRestore := &ChannelRestore{
+			MongoRestore: restore,
+			DocChan:      docChan,
+		}
+		return channelRestore, nil
 	}
 	return restore, nil
 }
@@ -153,6 +178,11 @@ func (restore *MongoRestore) Close() {
 	if ok { // should always be ok
 		barWriter.Stop()
 	}
+}
+
+// ToolOptions returns the ToolOptions field.
+func (restore *MongoRestore) GetToolOptions() *options.ToolOptions {
+	return restore.ToolOptions
 }
 
 // ParseAndValidateOptions returns a non-nil error if user-supplied options are invalid.

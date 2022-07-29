@@ -8,10 +8,15 @@
 package main
 
 import (
+	"fmt"
+	"sync"
+	"time"
+
 	"github.com/mongodb/mongo-tools/common/log"
 	"github.com/mongodb/mongo-tools/common/signals"
 	"github.com/mongodb/mongo-tools/common/util"
 	"github.com/mongodb/mongo-tools/mongorestore"
+	"go.mongodb.org/mongo-driver/bson"
 
 	"os"
 )
@@ -22,6 +27,7 @@ var (
 )
 
 func main() {
+	start := time.Now()
 	opts, err := mongorestore.ParseOptions(os.Args[1:], VersionStr, GitCommit)
 
 	if err != nil {
@@ -38,8 +44,43 @@ func main() {
 	if opts.PrintVersion() {
 		return
 	}
+	opts.ChannelRestore = true // notify extracted documents to channel
+	docChan := make(chan bson.Raw)
+	// printDoneChan := make(chan struct{})
+	var wg sync.WaitGroup
+	var readThread = 30
+	wg.Add(readThread)
+	for i := 0; i < readThread; i++ {
 
-	restore, err := mongorestore.New(opts)
+		// prints the output
+		go func() {
+			var failed, passed uint64
+			defer func() {
+				// close(printDoneChan)
+				wg.Done()
+			}()
+			for d := range docChan {
+
+				var i interface{}
+				if err = bson.Unmarshal(d, &i); err != nil {
+					// fmt.Printf("unmarshal bson error %v \n", err)
+					failed++
+					continue
+				}
+				passed++
+				// data, err := json.Marshal(i)
+				// if err != nil {
+				// 	fmt.Printf("marshal json error %v \n", err)
+				// 	continue
+				// }
+				// fmt.Printf("another json %s \n", string(data))
+
+			}
+			// fmt.Printf("docChan closed with %d unmarshal succeeded, %d unmarshal failed\n", passed, failed)
+		}()
+
+	}
+	restore, err := mongorestore.New(opts, docChan)
 	if err != nil {
 		log.Logvf(log.Always, err.Error())
 		os.Exit(util.ExitFailure)
@@ -53,13 +94,17 @@ func main() {
 	if result.Err != nil {
 		log.Logvf(log.Always, "Failed: %v", result.Err)
 	}
-
-	if restore.ToolOptions.WriteConcern.Acknowledged() {
+	// wait till doc printed
+	// <-printDoneChan
+	wg.Wait()
+	if restore.GetToolOptions().WriteConcern.Acknowledged() {
 		log.Logvf(log.Always, "%v document(s) restored successfully. %v document(s) failed to restore.", result.Successes, result.Failures)
 	} else {
 		log.Logvf(log.Always, "done")
 	}
-
+	end := time.Now()
+	duration := end.Sub(start)
+	fmt.Printf("cost: %s", duration.String())
 	if result.Err != nil {
 		os.Exit(util.ExitFailure)
 	}
