@@ -1,4 +1,6 @@
 # Purpose
+Modified mongorestore/readToChannel 
+
 Read mongodump output  and send it to a channel, so thirdparty apps could unmarshal at will, e.g. read from the channel and restore data to redis/in-process DB.  
 
 # some howtos
